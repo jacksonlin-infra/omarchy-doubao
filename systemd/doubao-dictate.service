@@ -1,0 +1,13 @@
+[Unit]
+Description=Doubao streaming dictation (push-to-talk with live overlay)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/doubao-dictate daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

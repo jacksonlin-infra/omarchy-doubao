@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+"""Push-to-talk dictation on Omarchy with Volcengine (Doubao) streaming ASR.
+
+Hold F9 and speak: audio streams to Doubao while you talk and the live
+transcript shows in a floating bar at the bottom of the screen. Release and
+the final (second-pass) text is typed at the cursor.
+
+  doubao-dictate daemon                  # what the user service runs
+  doubao-dictate start|stop|toggle|cancel|status
+  doubao-dictate selftest FILE.wav       # stream a 16 kHz mono WAV, print the text
+  doubao-dictate selftest --silence      # credentials / resource ID check only
+  doubao-dictate --version
+
+Config comes from ~/.config/doubao-dictate/doubao.env (see DEFAULTS below).
+"""
+
+__version__ = "0.2.0"
+
+import array
+import gzip
+import json
+import math
+import os
+import queue
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import wave
+
+# ---------------------------------------------------------------- config ----
+
+DEFAULTS = {
+    # 新版控制台：只需一个 API Key（请求头 X-Api-Key）
+    "DOUBAO_API_KEY": "",
+    # 旧版控制台：App ID + Access Token（请求头 X-Api-App-Key / X-Api-Access-Key）
+    # 两种填一种即可；都填时优先用 API Key
+    "DOUBAO_APP_ID": "",
+    "DOUBAO_ACCESS_TOKEN": "",
+    # 模型2.0：按时长 volc.seedasr.sauc.duration / 并发版 volc.seedasr.sauc.concurrent
+    # 模型1.0：按时长 volc.bigasr.sauc.duration  / 并发版 volc.bigasr.sauc.concurrent
+    "DOUBAO_RESOURCE_ID": "volc.seedasr.sauc.duration",
+    # async = 双向流式优化版：边说边出中间结果，松开后用非流式模型把整段再识别一遍（二遍识别）
+    "DOUBAO_ENDPOINT": "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
+    "DOUBAO_MODEL_NAME": "bigmodel",
+    "DOUBAO_UID": "doubao-dictate",
+    "DOUBAO_ENABLE_ITN": "1",   # 逆文本归一化：把"二零二五年"写成"2025年"
+    "DOUBAO_ENABLE_PUNC": "1",  # 自动标点
+    "DOUBAO_ENABLE_DDC": "1",   # 语义顺滑
+    "DOUBAO_TIMEOUT": "10",     # 松开后等最终结果的秒数；超时就用最后一次的中间结果
+    "DICTATE_MAX_SECS": "300",  # 单次录音上限，到点自动结束
+    "DICTATE_AUDIO_DEVICE": "",  # pw-record --target；空 = 系统默认麦克风
+    # type = 用 wtype 打到光标处；clipboard = 只复制到剪贴板；none = 只写日志（排障用）
+    "DICTATE_OUTPUT": "type",
+    "DICTATE_BOTTOM_MARGIN": "72",  # 悬浮条离屏幕底边的距离（逻辑像素）
+    "DICTATE_WIDTH": "640",         # 悬浮条宽度（逻辑像素）
+    "DOUBAO_DEBUG": "0",
+}
+
+APP = "doubao-dictate"
+RATE = 16000
+PACKET_BYTES = RATE * 2 // 5   # 200 ms of 16-bit mono: the packet size Doubao prefers
+LEVEL_BYTES = RATE * 2 // 20   # 50 ms slices drive the waveform
+
+
+def config_path():
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(config_home, APP, "doubao.env")
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    path = config_path()
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                cfg[key.strip()] = val.strip().strip('"').strip("'")
+    cfg.update({k: v for k, v in os.environ.items() if k in DEFAULTS})
+    return cfg
+
+
+CFG = load_config()
+DEBUG = CFG["DOUBAO_DEBUG"] not in ("", "0", "false", "no")
+
+
+def flag(key):
+    return CFG[key] not in ("", "0", "false", "no")
+
+
+def log(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+
+def dbg(*args):
+    if DEBUG:
+        log("[debug]", *args)
+
+
+def socket_path():
+    run_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return os.path.join(run_dir, f"{APP}.sock")
+
+
+# ------------------------------------------------- volcengine v3 protocol ----
+
+PROTOCOL_VERSION = 0b0001
+HEADER_SIZE = 0b0001
+
+CLIENT_FULL_REQUEST = 0b0001
+CLIENT_AUDIO_ONLY = 0b0010
+SERVER_FULL_RESPONSE = 0b1001
+SERVER_ACK = 0b1011
+SERVER_ERROR = 0b1111
+
+POS_SEQUENCE = 0b0001
+NEG_WITH_SEQUENCE = 0b0011
+
+NO_SERIALIZATION = 0b0000
+JSON_SERIALIZATION = 0b0001
+GZIP_COMPRESSION = 0b0001
+
+
+def frame(msg_type, flags, payload, seq=None, serial=JSON_SERIALIZATION):
+    """4-byte header [+ 4-byte sequence] + 4-byte payload size + gzip payload."""
+    body = gzip.compress(payload)
+    head = bytes([
+        (PROTOCOL_VERSION << 4) | HEADER_SIZE,
+        (msg_type << 4) | flags,
+        (serial << 4) | GZIP_COMPRESSION,
+        0x00,
+    ])
+    out = bytearray(head)
+    if seq is not None:
+        out += struct.pack(">i", seq)
+    out += struct.pack(">I", len(body))
+    out += body
+    return bytes(out)
+
+
+def parse_frame(data):
+    """-> (msg_type, flags, payload_obj_or_bytes)"""
+    header_size = data[0] & 0x0F
+    msg_type = data[1] >> 4
+    flags = data[1] & 0x0F
+    serial = data[2] >> 4
+    compression = data[2] & 0x0F
+    pos = header_size * 4
+
+    if flags & 0x01:  # carries a sequence number
+        pos += 4
+    code = None
+    if msg_type == SERVER_ERROR:
+        code = struct.unpack(">I", data[pos:pos + 4])[0]
+        pos += 4
+
+    size = struct.unpack(">I", data[pos:pos + 4])[0]
+    pos += 4
+    payload = data[pos:pos + size]
+
+    if compression == GZIP_COMPRESSION and payload:
+        payload = gzip.decompress(payload)
+    if serial == JSON_SERIALIZATION and payload:
+        payload = json.loads(payload.decode("utf-8"))
+    if code is not None:
+        payload = {"_error_code": code, "_error": payload}
+    return msg_type, flags, payload
+
+
+def build_request():
+    return {
+        "user": {"uid": CFG["DOUBAO_UID"]},
+        "audio": {
+            "format": "pcm",
+            "codec": "raw",
+            "rate": RATE,
+            "bits": 16,
+            "channel": 1,
+        },
+        "request": {
+            "model_name": CFG["DOUBAO_MODEL_NAME"],
+            "enable_itn": flag("DOUBAO_ENABLE_ITN"),
+            "enable_punc": flag("DOUBAO_ENABLE_PUNC"),
+            "enable_ddc": flag("DOUBAO_ENABLE_DDC"),
+            # 二遍识别：说话时给流式中间结果，末包后用非流式模型重识别，准确率和整段识别一致
+            "enable_nonstream": CFG["DOUBAO_ENDPOINT"].rstrip("/").endswith("bigmodel_async"),
+            "show_utterances": False,
+            "result_type": "full",
+        },
+    }
+
+
+def extract_text(payload):
+    """Dig the transcript out of a server response, tolerating shape changes."""
+    if not isinstance(payload, dict):
+        return ""
+    result = payload.get("result")
+    if isinstance(result, dict):
+        if result.get("text"):
+            return result["text"]
+        utts = result.get("utterances") or []
+        return "".join(u.get("text", "") for u in utts if isinstance(u, dict))
+    if isinstance(result, list):
+        return "".join(r.get("text", "") for r in result if isinstance(r, dict))
+    return payload.get("text", "") or ""
+
+
+def auth_headers():
+    """New console: one API key. Old console: App ID + Access Token."""
+    if CFG["DOUBAO_API_KEY"]:
+        return {"X-Api-Key": CFG["DOUBAO_API_KEY"]}
+    if CFG["DOUBAO_APP_ID"] and CFG["DOUBAO_ACCESS_TOKEN"]:
+        return {
+            "X-Api-App-Key": CFG["DOUBAO_APP_ID"],
+            "X-Api-Access-Key": CFG["DOUBAO_ACCESS_TOKEN"],
+        }
+    raise RuntimeError(
+        f"未配置凭据：在 {config_path()} 里填 DOUBAO_API_KEY（新版控制台），"
+        "或 DOUBAO_APP_ID + DOUBAO_ACCESS_TOKEN（旧版控制台）"
+    )
+
+
+def explain_handshake_error(exc):
+    """Turn a rejected WebSocket upgrade into an actionable message."""
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    body = ""
+    try:
+        body = (resp.body or b"").decode("utf-8", "replace")[:300]
+    except Exception:
+        pass
+    hint = ""
+    if "resource" in body.lower():
+        # e.g. 403 "requested resource not granted", 400 "resourceId ... is not allowed"
+        hint = ("资源 ID 不可用：确认控制台已开通对应模型，且 DOUBAO_RESOURCE_ID 与之对应"
+                "（模型2.0 = volc.seedasr.*，模型1.0 = volc.bigasr.*；按时长 .duration / 并发版 .concurrent）")
+    elif status in (401, 403):
+        hint = "凭据无效：检查 API Key / App ID / Access Token 是否抄全、是否属于同一个应用"
+    return RuntimeError(f"豆包建连被拒 HTTP {status}: {body} {hint}".strip())
+
+
+def recognize(packets, on_text=None, cancel=None):
+    """Stream audio to Doubao and return the final transcript.
+
+    `packets` yields (pcm_bytes, is_last) and may block while audio is being
+    recorded; it is drained on a sender thread so partial results arrive while
+    the user is still talking. `on_text(text)` sees every changed partial.
+    """
+    from websockets.exceptions import InvalidStatus
+    from websockets.sync.client import connect
+
+    headers = auth_headers()
+    headers.update({
+        "X-Api-Resource-Id": CFG["DOUBAO_RESOURCE_ID"],
+        "X-Api-Request-Id": str(uuid.uuid4()),
+        "X-Api-Connect-Id": str(uuid.uuid4()),
+    })
+    timeout = float(CFG["DOUBAO_TIMEOUT"])
+    cancel = cancel or threading.Event()
+
+    try:
+        ws = connect(CFG["DOUBAO_ENDPOINT"], additional_headers=headers,
+                     max_size=None, open_timeout=timeout, close_timeout=2)
+    except InvalidStatus as exc:
+        raise explain_handshake_error(exc) from None
+    with ws:
+        try:
+            dbg("logid", ws.response.headers.get("X-Tt-Logid"))
+        except Exception:
+            pass
+
+        ws.send(frame(CLIENT_FULL_REQUEST, POS_SEQUENCE,
+                      json.dumps(build_request()).encode("utf-8"), seq=1))
+        msg_type, _, payload = parse_frame(ws.recv(timeout=timeout))
+        dbg("handshake ->", msg_type, payload)
+        if msg_type == SERVER_ERROR:
+            raise RuntimeError(f"豆包握手失败: {payload}")
+
+        last_sent = threading.Event()
+        send_error = []
+
+        def sender():
+            seq = 1
+            try:
+                for pcm, last in packets:
+                    if cancel.is_set():
+                        return
+                    seq += 1
+                    ws.send(frame(
+                        CLIENT_AUDIO_ONLY,
+                        NEG_WITH_SEQUENCE if last else POS_SEQUENCE,
+                        pcm,
+                        seq=-seq if last else seq,
+                        serial=NO_SERIALIZATION,
+                    ))
+                    if last:
+                        last_sent.set()
+                        dbg(f"t={time.monotonic():.3f} last packet sent ({len(pcm)} bytes)")
+                        return
+            except Exception as exc:  # surfaces through the receive loop below
+                send_error.append(exc)
+
+        threading.Thread(target=sender, name="doubao-send", daemon=True).start()
+
+        text = ""
+        deadline = None
+        while not cancel.is_set():
+            if deadline is None and last_sent.is_set():
+                deadline = time.monotonic() + timeout
+            if deadline is not None and time.monotonic() > deadline:
+                log(f"warning: 等最终结果超时 {timeout:.0f}s，使用最后一次中间结果")
+                break
+            if send_error:
+                raise RuntimeError(f"发送音频失败: {send_error[0]}")
+            try:
+                data = ws.recv(timeout=0.25)
+            except TimeoutError:
+                continue
+            msg_type, flags, payload = parse_frame(data)
+            if msg_type == SERVER_ERROR:
+                raise RuntimeError(f"豆包识别失败: {payload}")
+            got = extract_text(payload)
+            if got and got != text:
+                text = got
+                if on_text:
+                    on_text(text)
+            if flags & 0x02:  # last packet from server
+                dbg(f"t={time.monotonic():.3f} final result received")
+                break
+    return text.strip()
+
+
+# ----------------------------------------------------------------- audio ----
+
+def level_of(pcm):
+    """0..1 loudness of a slice of s16le audio, on a log scale."""
+    samples = array.array("h", pcm[: len(pcm) // 2 * 2])
+    if not samples:
+        return 0.0
+    rms = math.sqrt(sum(s * s for s in samples) / len(samples))
+    db = 20 * math.log10(max(rms, 1.0) / 32768)
+    return min(1.0, max(0.0, (db + 55) / 45))
+
+
+class Microphone:
+    """pw-record as a raw 16 kHz mono stream, chopped into 200 ms packets."""
+
+    def __init__(self, on_level):
+        cmd = ["pw-record", "--raw", "--rate", str(RATE), "--channels", "1",
+               "--format", "s16"]
+        if CFG["DICTATE_AUDIO_DEVICE"]:
+            cmd += ["--target", CFG["DICTATE_AUDIO_DEVICE"]]
+        self.proc = subprocess.Popen(cmd + ["-"], stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL)
+        self.packets = queue.Queue()
+        self.on_level = on_level
+        self.bytes = 0
+        threading.Thread(target=self._read, name="mic", daemon=True).start()
+
+    def _read(self):
+        buf = b""
+        while True:
+            piece = self.proc.stdout.read(LEVEL_BYTES)
+            if not piece:
+                break
+            self.bytes += len(piece)
+            self.on_level(level_of(piece))
+            buf += piece
+            if len(buf) >= PACKET_BYTES:
+                self.packets.put((buf[:PACKET_BYTES], False))
+                buf = buf[PACKET_BYTES:]
+        dbg(f"t={time.monotonic():.3f} microphone closed")
+        self.packets.put((buf, True))
+
+    def __iter__(self):
+        while True:
+            item = self.packets.get()
+            yield item
+            if item[1]:
+                return
+
+    def stop(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+
+    def kill(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+
+    @property
+    def seconds(self):
+        return self.bytes / (RATE * 2)
+
+
+def wav_packets(path, realtime=False):
+    with wave.open(path) as w:
+        if (w.getframerate(), w.getnchannels(), w.getsampwidth()) != (RATE, 1, 2):
+            raise RuntimeError("需要 16kHz、单声道、16 位的 WAV")
+        pcm = w.readframes(w.getnframes())
+    return pcm_packets(pcm, realtime)
+
+
+def pcm_packets(pcm, realtime=False):
+    chunks = [pcm[i:i + PACKET_BYTES] for i in range(0, len(pcm), PACKET_BYTES)] or [b""]
+    start = time.monotonic()
+    for i, chunk in enumerate(chunks):
+        yield chunk, i == len(chunks) - 1
+        if realtime:
+            time.sleep(max(0.0, start + (i + 1) * 0.2 - time.monotonic()))
+
+
+# ---------------------------------------------------------------- output ----
+
+def output_text(text):
+    """Type at the cursor with wtype (the only driver that handles CJK);
+    fall back to the clipboard when the focused window refuses virtual input."""
+    mode = CFG["DICTATE_OUTPUT"]
+    if mode == "none":
+        log(f"output: {text}")
+        return
+    if mode != "clipboard":
+        try:
+            subprocess.run(["wtype", "-"], input=text.encode("utf-8"),
+                           check=True, timeout=30, stderr=subprocess.PIPE)
+            return
+        except Exception as exc:
+            log(f"wtype 失败，改用剪贴板: {exc}")
+    try:
+        subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=True, timeout=5)
+        if mode != "clipboard":
+            notify("没能直接输入，文字已复制到剪贴板", "按 Ctrl+V 粘贴")
+    except Exception as exc:
+        log(f"wl-copy 也失败了: {exc}")
+
+
+def notify(summary, body=""):
+    try:
+        subprocess.Popen(["notify-send", "-a", "豆包语音输入", summary, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------- overlay ----
+
+def theme_colors():
+    """Colors of the current Omarchy theme, with a dark fallback."""
+    colors = {"background": "#1e1e2e", "foreground": "#cdd6f4",
+              "accent": "#89b4fa", "red": "#f38ba8", "muted": "#7f849c"}
+    path = os.path.expanduser("~/.local/state/omarchy/current/theme/colors.toml")
+    try:
+        import tomllib
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+        colors.update({k: v for k, v in data.items() if k in colors and isinstance(v, str)})
+    except Exception:
+        pass
+    return colors
+
+
+def hex_rgb(color):
+    color = color.lstrip("#")
+    return tuple(int(color[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+class Overlay:
+    """Bottom-center layer-shell bar: waveform, status line, live transcript.
+    Never takes keyboard focus, so wtype still types into the window below."""
+
+    BARS = 48
+
+    def __init__(self):
+        from gi.repository import Gtk, Gtk4LayerShell as Layer, Pango
+        self.Gtk = Gtk
+        self.levels = [0.0] * self.BARS
+        self.hide_timer = 0
+        width = int(CFG["DICTATE_WIDTH"])
+        # ~1 CJK glyph per 16 px at the 15 px text size; two lines of it.
+        self.max_chars = max(20, (width - 48) // 16 * 2 - 2)
+
+        win = Gtk.Window()
+        win.set_decorated(False)
+        win.add_css_class("dictate")
+        Layer.init_for_window(win)
+        Layer.set_namespace(win, APP)
+        Layer.set_layer(win, Layer.Layer.OVERLAY)
+        Layer.set_anchor(win, Layer.Edge.BOTTOM, True)
+        Layer.set_margin(win, Layer.Edge.BOTTOM, int(CFG["DICTATE_BOTTOM_MARGIN"]))
+        Layer.set_keyboard_mode(win, Layer.KeyboardMode.NONE)
+        Layer.set_exclusive_zone(win, -1)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.add_css_class("card")
+        box.set_size_request(width, -1)
+
+        self.wave = Gtk.DrawingArea()
+        self.wave.set_content_height(22)
+        self.wave.set_draw_func(self._draw_wave)
+        box.append(self.wave)
+
+        self.status = Gtk.Label()
+        self.status.add_css_class("status")
+        box.append(self.status)
+
+        self.text = Gtk.Label()
+        self.text.add_css_class("text")
+        self.text.set_wrap(True)
+        self.text.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.text.set_justify(Gtk.Justification.CENTER)
+        self.text.set_lines(2)
+        self.text.set_ellipsize(Pango.EllipsizeMode.END)
+        # A wrapping label asks for as much width as its text; keep its request
+        # tiny so it wraps inside the card's fixed width instead of widening it.
+        self.text.set_max_width_chars(1)
+        box.append(self.text)
+
+        win.set_child(box)
+        self.win = win
+        self.wave_rgb = (0.5, 0.5, 0.5)
+        self.css = Gtk.CssProvider()
+        from gi.repository import Gdk
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), self.css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def _apply_theme(self):
+        c = theme_colors()
+        self.wave_rgb = hex_rgb(c["accent"])
+        r, g, b = (int(x * 255) for x in hex_rgb(c["background"]))
+        self.css.load_from_string(f"""
+            window.dictate {{ background: transparent; }}
+            .card {{
+              background: rgba({r},{g},{b},0.94);
+              border: 1px solid {c['accent']};
+              border-radius: 14px;
+              padding: 10px 24px 12px 24px;
+            }}
+            .status {{ color: {c['muted']}; font-size: 12px; }}
+            .status.error {{ color: {c['red']}; }}
+            .text {{ color: {c['foreground']}; font-size: 15px; }}
+            .text.placeholder {{ color: {c['muted']}; }}
+        """)
+
+    def _draw_wave(self, area, cr, width, height):
+        r, g, b = self.wave_rgb
+        step = width / self.BARS
+        for i, level in enumerate(self.levels):
+            h = max(2.0, level * height)
+            x = i * step + step * 0.25
+            cr.set_source_rgba(r, g, b, 0.35 + 0.65 * level)
+            cr.rectangle(x, (height - h) / 2, step * 0.5, h)
+            cr.fill()
+
+    # All methods below run on the GTK main thread.
+
+    def show(self):
+        from gi.repository import GLib
+        if self.hide_timer:
+            GLib.source_remove(self.hide_timer)
+            self.hide_timer = 0
+        self._apply_theme()
+        self.levels = [0.0] * self.BARS
+        self.set_status("正在聆听…")
+        self.set_text("")
+        self.win.set_visible(True)
+
+    def hide(self):
+        if self.hide_timer:
+            from gi.repository import GLib
+            GLib.source_remove(self.hide_timer)
+            self.hide_timer = 0
+        self.win.set_visible(False)
+
+    def push_level(self, level):
+        self.levels = self.levels[1:] + [level]
+        self.wave.queue_draw()
+
+    def set_status(self, status, error=False):
+        self.status.set_text(status)
+        if error:
+            self.status.add_css_class("error")
+        else:
+            self.status.remove_css_class("error")
+
+    def set_text(self, text):
+        if not text:
+            self.text.add_css_class("placeholder")
+            self.text.set_text("请开始说话")
+            return
+        self.text.remove_css_class("placeholder")
+        if len(text) > self.max_chars:  # keep the newest words in view
+            text = "…" + text[-(self.max_chars - 1):]
+        self.text.set_text(text)
+
+    def flash_error(self, message):
+        from gi.repository import GLib
+        self.win.set_visible(True)
+        self.set_status("出错了", error=True)
+        self.text.remove_css_class("placeholder")
+        self.text.set_text(message)
+        self.hide_timer = GLib.timeout_add_seconds(5, self._timeout_hide)
+
+    def _timeout_hide(self):
+        self.hide_timer = 0
+        self.win.set_visible(False)
+        return False
+
+
+# ---------------------------------------------------------------- daemon ----
+
+class Session:
+    """One press-to-release dictation. Network and audio run on worker
+    threads; every overlay update is marshalled onto the GTK thread."""
+
+    def __init__(self, daemon):
+        self.daemon = daemon
+        self.cancel = threading.Event()
+        self.stopped = False
+        self.started = time.monotonic()
+        self.mic = Microphone(on_level=lambda lv: self._ui(self.daemon.overlay.push_level, lv))
+        threading.Thread(target=self._run, name="session", daemon=True).start()
+
+    def _ui(self, fn, *args):
+        from gi.repository import GLib
+
+        def call():
+            if self.daemon.session is self and not self.cancel.is_set():
+                fn(*args)
+            return False
+        GLib.idle_add(call)
+
+    def stop(self):
+        dbg(f"t={time.monotonic():.3f} stop requested")
+        self.stopped = True
+        self.mic.stop()
+        self._ui(self.daemon.overlay.set_status, "识别中…")
+
+    def abort(self):
+        self.cancel.set()
+        self.mic.kill()
+
+    def _run(self):
+        from gi.repository import GLib
+        error = None
+        text = ""
+        try:
+            text = recognize(iter(self.mic),
+                             on_text=lambda t: self._ui(self.daemon.overlay.set_text, t),
+                             cancel=self.cancel)
+        except Exception as exc:
+            error = str(exc)
+            self.mic.kill()
+        if self.cancel.is_set():
+            return
+        if not error and self.mic.bytes == 0:
+            error = "没录到声音：检查麦克风（pw-record 没有输出）"
+        log(f"ok: {self.mic.seconds:.1f}s audio -> {len(text)} chars"
+            if not error else f"error: {error}")
+        dbg("text", repr(text))
+        GLib.idle_add(self.daemon.finished, self, text, error)
+
+
+class Daemon:
+    def __init__(self):
+        self.overlay = Overlay()
+        self.session = None
+        self.max_timer = 0
+
+    # -- commands (GTK thread) --
+
+    def start(self):
+        from gi.repository import GLib
+        if self.session and not self.session.stopped:
+            return
+        try:
+            auth_headers()
+        except RuntimeError as exc:
+            self.overlay.flash_error(str(exc))
+            return
+        # A previous session still waiting for its final result keeps running
+        # in the background and types its text when it arrives.
+        self.overlay.show()
+        self.session = Session(self)
+        self.max_timer = GLib.timeout_add_seconds(int(CFG["DICTATE_MAX_SECS"]), self._max_reached)
+
+    def stop(self):
+        if self.session and not self.session.stopped:
+            self._clear_max_timer()
+            self.session.stop()
+
+    def toggle(self):
+        if self.session and not self.session.stopped:
+            self.stop()
+        else:
+            self.start()
+
+    def cancel(self):
+        self._clear_max_timer()
+        if self.session:
+            self.session.abort()
+            self.session = None
+        self.overlay.hide()
+
+    def state(self):
+        if not self.session:
+            return "idle"
+        return "transcribing" if self.session.stopped else "recording"
+
+    def _max_reached(self):
+        self.max_timer = 0
+        self.stop()
+        return False
+
+    def _clear_max_timer(self):
+        from gi.repository import GLib
+        if self.max_timer:
+            GLib.source_remove(self.max_timer)
+            self.max_timer = 0
+
+    def finished(self, session, text, error):
+        if session is self.session:
+            self._clear_max_timer()
+            self.session = None
+            if error:
+                self.overlay.flash_error(error)
+            else:
+                self.overlay.hide()
+        if text and not error:
+            threading.Thread(target=output_text, args=(text,), daemon=True).start()
+        return False
+
+    # -- control socket --
+
+    def serve(self, path):
+        from gi.repository import GLib
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        os.chmod(path, 0o600)
+        srv.listen(8)
+        actions = {"start": self.start, "stop": self.stop,
+                   "toggle": self.toggle, "cancel": self.cancel}
+
+        def loop():
+            while True:
+                conn, _ = srv.accept()
+                with conn:
+                    cmd = conn.recv(64).decode("utf-8", "replace").strip()
+                    if cmd == "status":
+                        conn.sendall((self.state() + "\n").encode())
+                    elif cmd in actions:
+                        GLib.idle_add(lambda fn=actions[cmd]: fn() and False)
+                        conn.sendall(b"ok\n")
+                    else:
+                        conn.sendall(b"unknown command\n")
+
+        threading.Thread(target=loop, name="control", daemon=True).start()
+
+
+LAYER_SHELL_LIB = "/usr/lib/libgtk4-layer-shell.so"
+
+
+def run_daemon():
+    # gtk4-layer-shell must be loaded before libwayland-client, which Python's
+    # GTK bindings pull in on import. Re-exec once with it preloaded.
+    preload = os.environ.get("LD_PRELOAD", "")
+    if "gtk4-layer-shell" not in preload and os.path.exists(LAYER_SHELL_LIB):
+        os.environ["LD_PRELOAD"] = ":".join(p for p in (LAYER_SHELL_LIB, preload) if p)
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import GLib, Gtk
+
+    if not Gtk.init_check():
+        log("无法连接 Wayland 显示（WAYLAND_DISPLAY 未设置？）。这个服务要在桌面会话里运行。")
+        return 1
+    daemon = Daemon()
+    daemon.serve(socket_path())
+    loop = GLib.MainLoop()
+    try:
+        from gi.repository import GLibUnix
+        signal_add = GLibUnix.signal_add
+    except ImportError:  # PyGObject < 3.52
+        signal_add = GLib.unix_signal_add
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: loop.quit() or False)
+    log(f"{APP} {__version__} ready on {socket_path()} -> {CFG['DOUBAO_ENDPOINT']}")
+    loop.run()
+    return 0
+
+
+# ------------------------------------------------------------------ CLI ----
+
+def send_command(cmd):
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect(socket_path())
+            s.sendall(cmd.encode())
+            reply = s.recv(64).decode().strip()
+    except OSError:
+        log(f"{APP} 服务没在运行（systemctl --user status {APP}）")
+        if cmd != "status":
+            notify("豆包语音输入没在运行", f"systemctl --user restart {APP}")
+        return 1
+    if cmd == "status" or reply != "ok":
+        print(reply)
+    return 0
+
+
+def selftest(args):
+    if not args:
+        log(f"用法: {APP} selftest <16kHz 单声道 WAV> [--realtime] | --silence")
+        return 2
+    try:
+        if args[0] == "--silence":
+            packets = pcm_packets(b"\x00" * RATE * 2)  # 1 s: enough to clear the handshake
+        else:
+            packets = wav_packets(args[0], realtime="--realtime" in args)
+        partials = []
+        t0 = time.monotonic()
+        text = recognize(packets, on_text=partials.append)
+        elapsed = time.monotonic() - t0
+    except Exception as exc:
+        log(f"失败: {exc}")
+        return 1
+    if text:
+        print(text)
+        log(f"（{len(partials)} 次中间结果，总耗时 {elapsed:.2f}s）")
+    elif args[0] != "--silence":
+        log("鉴权和连接正常，但这段音频里没识别出文字（静音或纯音时属正常）")
+    return 0
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "daemon"
+    if cmd == "daemon":
+        return run_daemon()
+    if cmd in ("start", "stop", "toggle", "cancel", "status"):
+        return send_command(cmd)
+    if cmd == "selftest":
+        return selftest(sys.argv[2:])
+    if cmd in ("-V", "--version", "version"):
+        print(__version__)
+        return 0
+    print(__doc__.strip())
+    return 0 if cmd in ("-h", "--help", "help") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
