@@ -54,8 +54,9 @@ DEFAULTS = {
     "DOUBAO_TIMEOUT": "10",     # 松开后等最终结果的秒数；超时就用最后一次的中间结果
     "DICTATE_MAX_SECS": "300",  # 单次录音上限，到点自动结束
     "DICTATE_AUDIO_DEVICE": "",  # pw-record --target；空 = 系统默认麦克风
-    # type = 用 wtype 打到光标处；clipboard = 只复制到剪贴板；none = 只写日志（排障用）
-    "DICTATE_OUTPUT": "type",
+    # paste = 经剪贴板粘贴到光标处（之后还原原来的剪贴板文字）；type = 用 wtype 逐字输入；
+    # clipboard = 只复制到剪贴板；none = 只写日志（排障用）
+    "DICTATE_OUTPUT": "paste",
     "DICTATE_BOTTOM_MARGIN": "72",  # 悬浮条离屏幕底边的距离（逻辑像素）
     "DICTATE_WIDTH": "640",         # 悬浮条宽度（逻辑像素）
     "DOUBAO_DEBUG": "0",
@@ -418,26 +419,95 @@ def pcm_packets(pcm, realtime=False):
 
 # ---------------------------------------------------------------- output ----
 
+TERMINAL_CLASSES = ("ghostty", "alacritty", "kitty", "foot", "wezterm", "konsole", "terminal")
+
+
+def run_quiet(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, timeout=5, **kw)
+
+
+def active_window_is_terminal():
+    """Omarchy tags terminals with "terminal"; fall back to the window class."""
+    try:
+        win = json.loads(run_quiet(["hyprctl", "activewindow", "-j"], text=True).stdout or "{}")
+    except Exception:
+        return False
+    tags = [t.rstrip("*") for t in win.get("tags") or []]
+    cls = (win.get("class") or "").lower()
+    return "terminal" in tags or any(name in cls for name in TERMINAL_CLASSES)
+
+
+def send_paste_key():
+    """Shift+Insert in terminals, Ctrl+V elsewhere, the way Omarchy's universal
+    paste does it: Hyprland sends the key straight to the focused window, so
+    neither the virtual-keyboard keymap nor the input method (fcitx5) sees it."""
+    mods, key = ("SHIFT", "Insert") if active_window_is_terminal() else ("CTRL", "V")
+    lua = 'hl.dsp.send_key_state({{ mods = "{}", key = "{}", state = "{}" }})'
+    down = run_quiet(["hyprctl", "dispatch", lua.format(mods, key, "down")], text=True)
+    if down.returncode == 0 and down.stdout.strip() == "ok":  # Hyprland with Lua config
+        time.sleep(0.05)
+        run_quiet(["hyprctl", "dispatch", lua.format(mods, key, "up")])
+        return
+    legacy = run_quiet(["hyprctl", "dispatch", "sendshortcut", f"{mods},{key},"], text=True)
+    if legacy.returncode == 0 and legacy.stdout.strip() == "ok":  # hyprland.conf era
+        return
+    mod = "shift" if mods == "SHIFT" else "ctrl"
+    subprocess.run(["wtype", "-M", mod, "-k", key, "-m", mod], check=True, timeout=5)
+
+
+def clipboard_text():
+    """Current clipboard if it holds text, so it can be put back after pasting."""
+    try:
+        types = run_quiet(["wl-paste", "--list-types"], text=True).stdout.split()
+        if not any(t.startswith("text/") or t in ("UTF8_STRING", "STRING", "TEXT") for t in types):
+            return None
+        got = run_quiet(["wl-paste", "--no-newline"])
+        return got.stdout if got.returncode == 0 else None
+    except Exception:
+        return None
+
+
 def output_text(text):
-    """Type at the cursor with wtype (the only driver that handles CJK);
-    fall back to the clipboard when the focused window refuses virtual input."""
+    """Put the transcript at the cursor.
+
+    Default is clipboard + paste key. Typing CJK with wtype is unreliable when
+    an input method is running: wtype maps each character to a low keycode,
+    and fcitx5 reads some of those as Backspace/Tab/etc., silently dropping
+    characters (and pressing Tab in TUIs such as opencode)."""
     mode = CFG["DICTATE_OUTPUT"]
+    data = text.encode("utf-8")
     if mode == "none":
         log(f"output: {text}")
         return
-    if mode != "clipboard":
+    if mode == "type":
         try:
-            subprocess.run(["wtype", "-"], input=text.encode("utf-8"),
-                           check=True, timeout=30, stderr=subprocess.PIPE)
+            subprocess.run(["wtype", "-"], input=data, check=True, timeout=30,
+                           stderr=subprocess.PIPE)
             return
         except Exception as exc:
             log(f"wtype 失败，改用剪贴板: {exc}")
+            mode = "clipboard-fallback"
+    previous = clipboard_text() if mode == "paste" else None
     try:
-        subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=True, timeout=5)
-        if mode != "clipboard":
-            notify("没能直接输入，文字已复制到剪贴板", "按 Ctrl+V 粘贴")
+        subprocess.run(["wl-copy"], input=data, check=True, timeout=5)
     except Exception as exc:
-        log(f"wl-copy 也失败了: {exc}")
+        log(f"wl-copy 失败: {exc}")
+        return
+    if mode == "clipboard":
+        return
+    if mode == "paste":
+        time.sleep(0.15)  # let the clipboard offer reach the focused client
+        try:
+            send_paste_key()
+        except Exception as exc:
+            log(f"发送粘贴键失败: {exc}")
+            notify("没能自动粘贴，文字已复制到剪贴板", "按 Ctrl+V（终端里 Shift+Insert）粘贴")
+            return
+        if previous is not None:
+            time.sleep(0.5)  # the target reads the clipboard asynchronously
+            subprocess.run(["wl-copy"], input=previous, timeout=5)
+        return
+    notify("没能直接输入，文字已复制到剪贴板", "按 Ctrl+V 粘贴")
 
 
 def notify(summary, body=""):

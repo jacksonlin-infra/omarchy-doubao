@@ -2,6 +2,10 @@
 
 在 [Omarchy](https://omarchy.org) 上用**豆包语音识别**做语音输入：按住 **F9** 说话，屏幕底部的悬浮条**边说边出字**，松开后一秒左右，带标点的中文打到光标处。浏览器、终端、编辑器、Claude Code / Codex 的输入框都能用。
 
+![按住 F9 说话，底部悬浮条实时出字；松开后文字粘贴到 opencode 的输入框](docs/demo.gif)
+
+<sub>2 倍速播放。实录于 Omarchy 4，演示语音由 TTS 合成后经虚拟麦克风输入，其余流程（悬浮条、二遍识别、粘贴上屏）与按 F9 说话完全相同。</sub>
+
 豆包输入法没有 Linux 版，但它背后的识别引擎（火山引擎「豆包流式语音识别大模型」）开放了 API。本仓库用它的流式接口做了一个常驻服务，本机不跑任何模型。
 
 当前版本 **v0.2.0**，改动见 [CHANGELOG](CHANGELOG.md)。用过 v0.1.0 的，先看[从 v0.1.0 升级](#从-v010-升级)。
@@ -101,7 +105,7 @@ cd omarchy-doubao
 - 说话时屏幕底部的悬浮条显示音量波形和实时识别结果，悬浮条不抢焦点，文字仍然打到你原来的窗口。
 - 松开后悬浮条显示「识别中…」，豆包用非流式模型把整段再识别一遍（二遍识别），通常 1 秒内出最终结果。实时结果里偶尔的错字会在这一步纠正。
 - 单次最长 300 秒（`doubao.env` 里的 `DICTATE_MAX_SECS`），到点自动结束。
-- 某个窗口不接受模拟输入时，文字会落到剪贴板，`Ctrl+V` 粘贴即可。想一直只复制不打字，把 `DICTATE_OUTPUT` 改成 `clipboard`。
+- 文字是经剪贴板粘贴进去的（终端里发 Shift+Insert，其他程序发 Ctrl+V，和 Omarchy 的 Super+V 通用粘贴一样），粘贴后会还原你原来剪贴板里的文字；剪贴板里原来是图片等非文字内容时不会还原。想只复制不粘贴，把 `DICTATE_OUTPUT` 改成 `clipboard`。
 - 识别自带标点、把“二零二五年”写成“2025年”（`doubao.env` 里的 ITN / PUNC 开关）。“嗯”“这个”“那个”这类口水词目前会保留，自动去除计划在下一版用大模型润色来做。
 - 改了 `doubao.env` 后执行 `systemctl --user restart doubao-dictate` 生效。
 
@@ -111,7 +115,7 @@ cd omarchy-doubao
 按住 F9 ─▶ doubao-dictate start ─▶ pw-record 录音，每 200ms 一包 ─▶ 豆包 bigmodel_async（流式 + 二遍识别）
                                                                            │ 实时结果
                                       屏幕底部悬浮条（GTK4 layer-shell）◀──┘
-松开 F9 ─▶ doubao-dictate stop  ─▶ 发最后一包 ─▶ 最终结果 ─▶ wtype 打到光标处
+松开 F9 ─▶ doubao-dictate stop  ─▶ 发最后一包 ─▶ 最终结果 ─▶ 经剪贴板粘贴到光标处
 ```
 
 `doubao-dictate` 是一个用户级常驻服务（单个 Python 脚本，依赖 `python-websockets` 和 GTK4）。Hyprland 快捷键通过本地 socket 给它发 `start` / `stop` / `toggle`。按下时同时开始录音和连接豆包，连上之前录到的音会先缓存，不丢开头；说话时音频边录边发，所以松开时服务端只剩最后一点工作。
@@ -148,7 +152,8 @@ journalctl --user -u doubao-dictate -f
 | 按 F9 没反应 | 执行 `hyprctl reload` 或注销重登；再看 `systemctl --user status doubao-dictate`。服务没运行时按 F9 会弹通知提示 |
 | 悬浮条出现了，但一直不出字 | 看 `journalctl --user -u doubao-dictate -n 30`；多半是凭据、资源 ID 或网络 |
 | 悬浮条提示「没录到声音」 | 麦克风不可用；`wpctl status` 看默认输入设备，或在 `DICTATE_AUDIO_DEVICE` 里指定 |
-| 说话时出字，但松开后没打到光标处 | 那个窗口不接受模拟输入，文字已在剪贴板里，`Ctrl+V` 粘贴 |
+| 说话时出字，但松开后没粘贴到光标处 | 那个程序不认 Ctrl+V / Shift+Insert；文字还在剪贴板里，手动粘贴。悬浮条消失后约 0.5 秒剪贴板会还原成原来的文字，要手动粘贴就把 `DICTATE_OUTPUT` 改成 `clipboard` |
+| 改成 `DICTATE_OUTPUT=type` 后中文丢字、TUI 里莫名切换模式 | wtype 逐字输入会经过 fcitx5 等输入法，部分汉字被当成 Backspace / Tab 吞掉；改回默认的 `paste` |
 | 安装脚本退出码 3 | 装系统包需要 sudo 密码；在终端执行脚本打印的那条 `sudo pacman ...`，然后重跑 `./install.sh` |
 | 识别慢 | 网络到 `openspeech.bytedance.com` 的延迟；挂了代理的话让这个域名直连 |
 
